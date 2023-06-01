@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 	_ "net/http/pprof"
@@ -91,6 +92,7 @@ var (
 	apiWriteTimeoutMs      = cli.GetEnvInt("API_TIMEOUT_WRITE_MS", 10000)
 	apiIdleTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_IDLE_MS", 3000)
 	apiMaxHeaderBytes      = cli.GetEnvInt("API_MAX_HEADER_BYTES", 60000)
+	bidStatsTallyItems     = cli.GetEnvInt("BID_STATS_TALLY_ITEMS", 100) // after these many bids, compare the stats
 
 	// user-agents which shouldn't receive bids
 	apiNoHeaderUserAgents = common.GetEnvStrSlice("NO_HEADER_USERAGENTS", []string{
@@ -198,6 +200,8 @@ type RelayAPI struct {
 	payloadAttributes     map[string]payloadAttributesHelper // key:parentBlockHash
 	payloadAttributesLock sync.RWMutex
 
+	blockSubmissionStats *BidStats
+
 	// The slot we are currently optimistically simulating.
 	optimisticSlot uberatomic.Uint64
 	// The number of optimistic blocks being processed (only used for logging).
@@ -270,7 +274,8 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		proposerDutiesResponse: &[]byte{},
 		blockSimRateLimiter:    NewBlockSimulationRateLimiter(opts.BlockSimURL),
 
-		validatorRegC: make(chan boostTypes.SignedValidatorRegistration, 450_000),
+		validatorRegC:        make(chan boostTypes.SignedValidatorRegistration, 450_000),
+		blockSubmissionStats: NewBidStats(uint64(bidStatsTallyItems)),
 	}
 
 	if os.Getenv("FORCE_GET_HEADER_204") == "1" {
@@ -1696,8 +1701,23 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	// ---------------------------------------------------------------
+	// AT THIS POINT, SIGNATURE IS VALIDATED AND BLOCK IS LOOKING GOOD
+	// ---------------------------------------------------------------
+	// Add to stats
+	isLargePayload := false
+	deviationPercent := math.Abs(api.blockSubmissionStats.PayloadSizeDeviation(uint64(len(requestPayloadBytes))))
+	if deviationPercent > 0.5 {
+		isLargePayload = true
+	} else {
+		api.blockSubmissionStats.AddEntry(headSlot, len(requestPayloadBytes))
+	}
+	log = log.WithField("isLargePayload", isLargePayload)
+
+	// Remember the time when it was eligible for inclusion
 	var eligibleAt time.Time
-	// Used to communicate simulation result to the deferred function
+
+	// channel to send simulation result to the deferred function
 	simResultC := make(chan *blockSimResult, 1)
 
 	// Save the builder submission to the database whenever this function ends
@@ -1766,7 +1786,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	// Simulate the block submission and save to db
-	fastTrackValidation := builderEntry.status.IsHighPrio && bidIsTopBid
+	fastTrackValidation := builderEntry.status.IsHighPrio && bidIsTopBid && !isLargePayload
 	timeBeforeValidation := time.Now().UTC()
 
 	log = log.WithFields(logrus.Fields{
