@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"net/url"
 	"os"
 	"os/signal"
@@ -185,23 +186,19 @@ var apiCmd = &cobra.Command{
 		}
 
 		// Create a signal handler
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
+		// Start the server
 		go func() {
-			sig := <-sigs
-			log.Infof("signal received: %s", sig)
-			err := srv.StopServer()
+			log.Infof("Webserver starting on %s ...", apiListenAddr)
+			err = srv.StartServer()
 			if err != nil {
-				log.WithError(err).Fatal("error stopping server")
+				log.WithError(err).Fatal("server error")
 			}
 		}()
 
-		// Start the server
-		log.Infof("Webserver starting on %s ...", apiListenAddr)
-		err = srv.StartServer()
-		if err != nil {
-			log.WithError(err).Fatal("server error")
-		}
+		<-ctx.Done()
+		stop()
 		log.Info("bye")
 	},
 }
